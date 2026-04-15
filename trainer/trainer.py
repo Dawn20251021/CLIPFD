@@ -134,12 +134,16 @@ class Trainer:
 
         return metrics
 
-    def train_one_epoch(self, loader, epoch: int = 0, log_interval: int = 50) -> Dict[str, float]:
+    def train_one_epoch(self, loader, epoch: int = 0, log_interval: int = 50):
         self.model.train()
 
-        running_loss = 0.0
-        running_tri_acc = 0.0
-        running_bin_acc = 0.0
+        running = {
+            "loss": 0.0,
+            "loss_tri": 0.0,
+            "loss_bin": 0.0,
+            "tri_acc": 0.0,
+            "bin_acc": 0.0,
+        }
         num_steps = 0
 
         for step, batch in enumerate(loader, start=1):
@@ -167,37 +171,58 @@ class Trainer:
 
             metrics = self._compute_batch_metrics(outputs, batch)
 
-            running_loss += loss.item()
-            running_tri_acc += metrics.get("tri_acc", 0.0)
-            running_bin_acc += metrics.get("bin_acc", 0.0)
+            running["loss"] += loss_dict["loss"].item()
+            running["loss_tri"] += loss_dict["loss_tri"].item()
+            if "loss_bin" in loss_dict:
+                running["loss_bin"] += loss_dict["loss_bin"].item()
+
+            running["tri_acc"] += metrics.get("tri_acc", 0.0)
+            running["bin_acc"] += metrics.get("bin_acc", 0.0)
+
             num_steps += 1
 
             if step % log_interval == 0:
-                msg = f"[Train] epoch={epoch} step={step}/{len(loader)} loss={loss.item():.4f}"
-                if "tri_acc" in metrics:
-                    msg += f" tri_acc={metrics['tri_acc']:.4f}"
-                if "bin_acc" in metrics:
-                    msg += f" bin_acc={metrics['bin_acc']:.4f}"
-                print(msg)
+                print(
+                    f"[Train] epoch={epoch} step={step}/{len(loader)} "
+                    f"loss={loss_dict['loss'].item():.4f} "
+                    f"tri_acc={metrics.get('tri_acc', 0.0):.4f} "
+                    f"bin_acc={metrics.get('bin_acc', 0.0):.4f}"
+                )
+
+        current_lr = self.optimizer.param_groups[0]["lr"]
 
         result = {
-            "loss": running_loss / max(num_steps, 1),
-            "tri_acc": running_tri_acc / max(num_steps, 1),
+            "loss": running["loss"] / max(num_steps, 1),
+            "loss_tri": running["loss_tri"] / max(num_steps, 1),
+            "tri_acc": running["tri_acc"] / max(num_steps, 1),
+            "lr": current_lr,
         }
 
-        if running_bin_acc > 0:
-            result["bin_acc"] = running_bin_acc / max(num_steps, 1)
+        if running["loss_bin"] > 0:
+            result["loss_bin"] = running["loss_bin"] / max(num_steps, 1)
+        if running["bin_acc"] > 0:
+            result["bin_acc"] = running["bin_acc"] / max(num_steps, 1)
 
         return result
 
     @torch.no_grad()
-    def evaluate(self, loader, epoch: int = 0) -> Dict[str, float]:
+    def evaluate(self, loader, epoch: int = 0):
         self.model.eval()
 
-        running_loss = 0.0
-        running_tri_acc = 0.0
-        running_bin_acc = 0.0
+        running = {
+            "loss": 0.0,
+            "loss_tri": 0.0,
+            "loss_bin": 0.0,
+            "tri_acc": 0.0,
+            "bin_acc": 0.0,
+        }
         num_steps = 0
+
+        all_tri_probs = []
+        all_tri_targets = []
+
+        all_bin_probs = []
+        all_bin_targets = []
 
         for batch in loader:
             batch = self._move_batch_to_device(batch)
@@ -209,29 +234,71 @@ class Trainer:
                     return_features=False,
                 )
                 loss_dict = self.compute_losses(outputs, batch)
-                loss = loss_dict["loss"]
 
             metrics = self._compute_batch_metrics(outputs, batch)
 
-            running_loss += loss.item()
-            running_tri_acc += metrics.get("tri_acc", 0.0)
-            running_bin_acc += metrics.get("bin_acc", 0.0)
+            running["loss"] += loss_dict["loss"].item()
+            running["loss_tri"] += loss_dict["loss_tri"].item()
+            if "loss_bin" in loss_dict:
+                running["loss_bin"] += loss_dict["loss_bin"].item()
+
+            running["tri_acc"] += metrics.get("tri_acc", 0.0)
+            running["bin_acc"] += metrics.get("bin_acc", 0.0)
+
             num_steps += 1
 
+            tri_probs = torch.softmax(outputs["logits"], dim=1)
+            tri_targets = batch["multi_label"]
+            all_tri_probs.append(tri_probs.detach().cpu())
+            all_tri_targets.append(tri_targets.detach().cpu())
+
+            if "global_logits" in outputs and "binary_label" in batch:
+                g = outputs["global_logits"].squeeze(1)
+                bin_probs = torch.sigmoid(g)
+                bin_targets = batch["binary_label"]
+                all_bin_probs.append(bin_probs.detach().cpu())
+                all_bin_targets.append(bin_targets.detach().cpu())
+
         result = {
-            "loss": running_loss / max(num_steps, 1),
-            "tri_acc": running_tri_acc / max(num_steps, 1),
+            "loss": running["loss"] / max(num_steps, 1),
+            "loss_tri": running["loss_tri"] / max(num_steps, 1),
+            "tri_acc": running["tri_acc"] / max(num_steps, 1),
         }
 
-        if running_bin_acc > 0:
-            result["bin_acc"] = running_bin_acc / max(num_steps, 1)
+        if running["loss_bin"] > 0:
+            result["loss_bin"] = running["loss_bin"] / max(num_steps, 1)
+        if running["bin_acc"] > 0:
+            result["bin_acc"] = running["bin_acc"] / max(num_steps, 1)
 
-        print(
-            f"[Eval] epoch={epoch} "
-            f"loss={result['loss']:.4f} "
-            f"tri_acc={result['tri_acc']:.4f}"
-            + (f" bin_acc={result['bin_acc']:.4f}" if "bin_acc" in result else "")
-        )
+        # ===== 这里补 AUC =====
+        if len(all_tri_probs) > 0:
+            tri_probs = torch.cat(all_tri_probs, dim=0).numpy()
+            tri_targets = torch.cat(all_tri_targets, dim=0)
+            tri_targets_onehot = F.one_hot(tri_targets, num_classes=tri_probs.shape[1]).numpy()
+
+            try:
+                from sklearn.metrics import roc_auc_score
+                macro_auc = roc_auc_score(
+                    tri_targets_onehot,
+                    tri_probs,
+                    multi_class="ovr",
+                    average="macro",
+                )
+                result["macro_auc"] = float(macro_auc)
+            except ValueError:
+                pass
+
+        if len(all_bin_probs) > 0:
+            bin_probs = torch.cat(all_bin_probs, dim=0).numpy()
+            bin_targets = torch.cat(all_bin_targets, dim=0).numpy()
+
+            try:
+                from sklearn.metrics import roc_auc_score
+                binary_auc = roc_auc_score(bin_targets, bin_probs)
+                result["binary_auc"] = float(binary_auc)
+            except ValueError:
+                pass
+
         return result
 
     @torch.no_grad()
