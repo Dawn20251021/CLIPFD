@@ -5,7 +5,7 @@ from tensorboardX import SummaryWriter
 from validate import validate
 from data import create_dataloader
 from earlystop import EarlyStopping
-from networks.trainer import Trainer
+from trainer.trainer import Trainer
 from options.train_options import TrainOptions
 
 
