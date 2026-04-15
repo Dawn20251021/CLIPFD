@@ -1,85 +1,166 @@
-import os
-import time
-from tensorboardX import SummaryWriter
+from __future__ import annotations
 
-from validate import validate
-from data import create_dataloader
-from earlystop import EarlyStopping
-from trainer.trainer import Trainer
+from pathlib import Path
+
+from data import build_train_loader, build_test_loader
+from models.assemble_model import CLIPFDModel
 from options.train_options import TrainOptions
+from trainer.trainer import Trainer
 
 
-"""Currently assumes jpg_prob, blur_prob 0 or 1"""
-def get_val_opt():
-    val_opt = TrainOptions().parse(print_options=False)
-    val_opt.isTrain = False
-    val_opt.no_resize = False
-    val_opt.no_crop = False
-    val_opt.serial_batches = True
-    val_opt.data_label = 'val'
-    val_opt.jpg_method = ['pil']
-    if len(val_opt.blur_sig) == 2:
-        b_sig = val_opt.blur_sig
-        val_opt.blur_sig = [(b_sig[0] + b_sig[1]) / 2]
-    if len(val_opt.jpg_qual) != 1:
-        j_qual = val_opt.jpg_qual
-        val_opt.jpg_qual = [int((j_qual[0] + j_qual[-1]) / 2)]
-
-    return val_opt
+def get_device(opt) -> str:
+    if len(opt.gpu_ids) > 0:
+        return "cuda"
+    return "cpu"
 
 
+def build_model(opt, device: str) -> CLIPFDModel:
+    model = CLIPFDModel(
+        backbone_name=opt.backbone_name,
+        freeze_backbone=opt.freeze_backbone,
+        device=device,
+        final_num_classes=opt.final_num_classes,
+        aux_num_classes=opt.aux_num_classes,
+        local_hidden_dim=opt.local_hidden_dim,
+        local_out_dim=opt.local_out_dim,
+        local_num_blocks=opt.local_num_blocks,
+        proj_dropout=opt.proj_dropout,
+        block_dropout=opt.block_dropout,
+        gn_groups=opt.gn_groups,
+        fusion_dropout=opt.fusion_dropout,
+        use_global_aux_head=opt.use_global_aux_head,
+    )
+    return model
 
-if __name__ == '__main__':
+
+def build_dataloaders(opt):
+    train_dataset, train_loader = build_train_loader(
+        image_root=opt.train_image_root,
+        label_json_path=opt.train_label_json,
+        batch_size=opt.batch_size,
+        image_size=opt.image_size,
+        load_size=opt.load_size,
+        num_workers=opt.num_workers,
+        pin_memory=opt.pin_memory,
+        persistent_workers=opt.persistent_workers,
+        no_crop=opt.no_crop,
+        no_flip=opt.no_flip,
+        blur_prob=opt.blur_prob,
+        blur_radius=opt.blur_radius,
+        jpg_prob=opt.jpg_prob,
+        jpg_quality=opt.jpg_quality,
+    )
+
+    val_dataset, val_loader = build_test_loader(
+        image_root=opt.val_image_root,
+        label_json_path=opt.val_label_json,
+        batch_size=opt.batch_size,
+        image_size=opt.image_size,
+        load_size=opt.load_size,
+        num_workers=opt.num_workers,
+        pin_memory=opt.pin_memory,
+        persistent_workers=opt.persistent_workers,
+        no_crop=opt.no_crop,
+    )
+
+    return train_dataset, train_loader, val_dataset, val_loader
+
+
+def main():
     opt = TrainOptions().parse()
-    val_opt = get_val_opt()
- 
-    model = Trainer(opt)
-    
-    data_loader = create_dataloader(opt)
-    val_loader = create_dataloader(val_opt)
+    device = get_device(opt)
 
-    train_writer = SummaryWriter(os.path.join(opt.checkpoints_dir, opt.name, "train"))
-    val_writer = SummaryWriter(os.path.join(opt.checkpoints_dir, opt.name, "val"))
-        
-    # early_stopping = EarlyStopping(patience=opt.earlystop_epoch, delta=-0.001, verbose=True)
-    start_time = time.time()
-    print ("Length of data loader: %d" %(len(data_loader)))
-    for epoch in range(opt.niter):
-        
-        for i, data in enumerate(data_loader):
-            model.total_steps += 1
+    save_dir = Path(opt.checkpoints_dir) / opt.name
+    save_dir.mkdir(parents=True, exist_ok=True)
 
-            model.set_input(data)
-            model.optimize_parameters()
+    # 1. dataloader
+    train_dataset, train_loader, val_dataset, val_loader = build_dataloaders(opt)
 
-            if model.total_steps % opt.loss_freq == 0:
-                print("Train loss: {} at step: {}".format(model.loss, model.total_steps))
-                train_writer.add_scalar('loss', model.loss, model.total_steps)
-                print("Iter time: ", ((time.time()-start_time)/model.total_steps)  )
+    print(f"Train dataset size: {len(train_dataset)}")
+    print(f"Val dataset size:   {len(val_dataset)}")
+    print(f"Train loader steps per epoch: {len(train_loader)}")
+    print(f"Val loader steps:            {len(val_loader)}")
 
-            if model.total_steps in [10,30,50,100,1000,5000,10000] and False: # save models at these iters 
-                model.save_networks('model_iters_%s.pth' % model.total_steps)
+    # 2. model
+    model = build_model(opt, device=device)
 
-        if epoch % opt.save_epoch_freq == 0:
-            print('saving the model at the end of epoch %d' % (epoch))
-            model.save_networks( 'model_epoch_best.pth' )
-            model.save_networks( 'model_epoch_%s.pth' % epoch )
+    # 3. trainer
+    trainer = Trainer(
+        model=model,
+        device=device,
+        lr=opt.lr,
+        weight_decay=opt.weight_decay,
+        optimizer_type=opt.optimizer,
+        aux_loss_weight=opt.aux_loss_weight,
+        label_smoothing=opt.label_smoothing,
+        use_amp=opt.use_amp,
+        grad_clip_norm=opt.grad_clip_norm,
+        save_dir=str(save_dir),
+    )
 
-        # Validation
-        model.eval()
-        ap, r_acc, f_acc, acc = validate(model.model, val_loader)
-        val_writer.add_scalar('accuracy', acc, model.total_steps)
-        val_writer.add_scalar('ap', ap, model.total_steps)
-        print("(Val @ epoch {}) acc: {}; ap: {}".format(epoch, acc, ap))
+    # ===== 可选：断点恢复 =====
+    start_epoch = 0
+    # 如果你后面加 resume 参数，可以在这里恢复
+    # if opt.resume_path:
+    #     start_epoch, _ = trainer.load_checkpoint(opt.resume_path, strict=True)
+    #     start_epoch += 1
 
-        early_stopping(acc, model)
-        if early_stopping.early_stop:
-            cont_train = model.adjust_learning_rate()
-            if cont_train:
-                print("Learning rate dropped by 10, continue training...")
-                early_stopping = EarlyStopping(patience=opt.earlystop_epoch, delta=-0.002, verbose=True)
-            else:
-                print("Early stopping.")
-                break
-        model.train()
+    # 4. train loop
+    best_metric = float("-inf")
+    best_metric_name = "macro_auc" if opt.final_num_classes > 2 else "tri_acc"
 
+    print(f"Best model selection metric: {best_metric_name}")
+
+    for epoch in range(start_epoch, opt.epochs):
+        print(f"\n========== Epoch {epoch + 1}/{opt.epochs} ==========")
+
+        train_metrics = trainer.train_one_epoch(
+            train_loader,
+            epoch=epoch,
+            log_interval=opt.log_interval,
+        )
+        print(f"[Train] {train_metrics}")
+
+        val_metrics = trainer.evaluate(
+            val_loader,
+            epoch=epoch,
+        )
+        print(f"[Val]   {val_metrics}")
+
+        # 5. 保存最新/周期模型
+        if (epoch + 1) % opt.save_epoch_freq == 0:
+            trainer.save_checkpoint(
+                filename=f"epoch_{epoch + 1}.pth",
+                epoch=epoch,
+                extra={
+                    "train_metrics": train_metrics,
+                    "val_metrics": val_metrics,
+                },
+            )
+
+        # 6. 保存最佳模型
+        current_metric = val_metrics.get(best_metric_name, None)
+
+        # 如果没有 macro_auc，就退回 tri_acc
+        if current_metric is None:
+            current_metric = val_metrics.get("tri_acc", None)
+
+        if current_metric is not None and current_metric > best_metric:
+            best_metric = current_metric
+            trainer.save_checkpoint(
+                filename="best.pth",
+                epoch=epoch,
+                extra={
+                    "best_metric_name": best_metric_name,
+                    "best_metric_value": best_metric,
+                    "train_metrics": train_metrics,
+                    "val_metrics": val_metrics,
+                },
+            )
+            print(f"[Best] Updated best model: {best_metric_name}={best_metric:.6f}")
+
+    print("\nTraining finished.")
+
+
+if __name__ == "__main__":
+    main()
