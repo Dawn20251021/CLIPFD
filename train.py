@@ -2,35 +2,33 @@ from __future__ import annotations
 
 from pathlib import Path
 
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except ImportError:
+    try:
+        from tensorboardX import SummaryWriter
+    except ImportError:
+        SummaryWriter = None
+
 from data_deal import build_train_loader, build_test_loader
 from models.assemble_model import CLIPFDModel
 from options.train_options import TrainOptions
 from trainer.trainer import Trainer
 
+# 可选：如果你已经把这个工具加进仓库了，就会自动启用
+try:
+    from utils.training_monitor import TrainingVisualizer
+except ImportError:
+    TrainingVisualizer = None
+
+
+def opt_get(opt, name, default):
+    return getattr(opt, name, default)
+
 
 def get_device(opt) -> str:
-    if len(opt.gpu_ids) > 0:
-        return "cuda"
-    return "cpu"
-
-
-def build_model(opt, device: str) -> CLIPFDModel:
-    model = CLIPFDModel(
-        backbone_name=opt.backbone_name,
-        freeze_backbone=opt.freeze_backbone,
-        device=device,
-        final_num_classes=opt.final_num_classes,
-        aux_num_classes=opt.aux_num_classes,
-        local_hidden_dim=opt.local_hidden_dim,
-        local_out_dim=opt.local_out_dim,
-        local_num_blocks=opt.local_num_blocks,
-        proj_dropout=opt.proj_dropout,
-        block_dropout=opt.block_dropout,
-        gn_groups=opt.gn_groups,
-        fusion_dropout=opt.fusion_dropout,
-        use_global_aux_head=opt.use_global_aux_head,
-    )
-    return model
+    gpu_ids = opt_get(opt, "gpu_ids", [])
+    return "cuda" if len(gpu_ids) > 0 else "cpu"
 
 
 def build_dataloaders(opt):
@@ -38,32 +36,110 @@ def build_dataloaders(opt):
         image_root=opt.train_image_root,
         label_json_path=opt.train_label_json,
         batch_size=opt.batch_size,
-        image_size=opt.image_size,
-        load_size=opt.load_size,
-        num_workers=opt.num_workers,
-        pin_memory=opt.pin_memory,
-        persistent_workers=opt.persistent_workers,
-        no_crop=opt.no_crop,
-        no_flip=opt.no_flip,
-        blur_prob=opt.blur_prob,
-        blur_radius=opt.blur_radius,
-        jpg_prob=opt.jpg_prob,
-        jpg_quality=opt.jpg_quality,
+        image_size=opt_get(opt, "image_size", 224),
+        load_size=opt_get(opt, "load_size", 256),
+        num_workers=opt_get(opt, "num_workers", 4),
+        pin_memory=opt_get(opt, "pin_memory", False),
+        persistent_workers=opt_get(opt, "persistent_workers", False),
+        no_crop=opt_get(opt, "no_crop", False),
+        no_flip=opt_get(opt, "no_flip", False),
+        blur_prob=opt_get(opt, "blur_prob", 0.0),
+        blur_radius=opt_get(opt, "blur_radius", (0.1, 1.5)),
+        jpg_prob=opt_get(opt, "jpg_prob", 0.0),
+        jpg_quality=opt_get(opt, "jpg_quality", (65, 95)),
     )
 
     val_dataset, val_loader = build_test_loader(
         image_root=opt.val_image_root,
         label_json_path=opt.val_label_json,
         batch_size=opt.batch_size,
-        image_size=opt.image_size,
-        load_size=opt.load_size,
-        num_workers=opt.num_workers,
-        pin_memory=opt.pin_memory,
-        persistent_workers=opt.persistent_workers,
-        no_crop=opt.no_crop,
+        image_size=opt_get(opt, "image_size", 224),
+        load_size=opt_get(opt, "load_size", 256),
+        num_workers=opt_get(opt, "num_workers", 4),
+        pin_memory=opt_get(opt, "pin_memory", False),
+        persistent_workers=opt_get(opt, "persistent_workers", False),
+        no_crop=opt_get(opt, "no_crop", False),
     )
 
     return train_dataset, train_loader, val_dataset, val_loader
+
+
+def build_model(opt, device: str) -> CLIPFDModel:
+    model = CLIPFDModel(
+        backbone_name=opt.backbone_name,
+        freeze_backbone=opt_get(opt, "freeze_backbone", True),
+        device=device,
+        final_num_classes=opt_get(opt, "final_num_classes", 3),
+        aux_num_classes=opt_get(opt, "aux_num_classes", 1),
+        local_hidden_dim=opt_get(opt, "local_hidden_dim", 256),
+        local_out_dim=opt_get(opt, "local_out_dim", 768),
+        local_num_blocks=opt_get(opt, "local_num_blocks", 2),
+        proj_dropout=opt_get(opt, "proj_dropout", 0.1),
+        block_dropout=opt_get(opt, "block_dropout", 0.0),
+        gn_groups=opt_get(opt, "gn_groups", 8),
+        fusion_dropout=opt_get(opt, "fusion_dropout", 0.1),
+        use_global_aux_head=opt_get(opt, "use_global_aux_head", True),
+    )
+    return model
+
+
+def build_trainer(opt, model, save_dir: Path, device: str) -> Trainer:
+    trainer = Trainer(
+        model=model,
+        device=device,
+        lr=opt_get(opt, "lr", 1e-4),
+        weight_decay=opt_get(opt, "weight_decay", 1e-4),
+        optimizer_type=opt_get(opt, "optimizer", "adamw"),
+        aux_loss_weight=opt_get(opt, "aux_loss_weight", 0.3),
+        label_smoothing=opt_get(opt, "label_smoothing", 0.0),
+        use_amp=opt_get(opt, "use_amp", False),
+        grad_clip_norm=opt_get(opt, "grad_clip_norm", 1.0),
+        save_dir=str(save_dir),
+    )
+    return trainer
+
+
+def choose_best_metric(val_metrics: dict) -> str:
+    """
+    优先用更有区分力的指标
+    """
+    if "macro_auc" in val_metrics and val_metrics["macro_auc"] == val_metrics["macro_auc"]:
+        return "macro_auc"
+    if "tri_acc" in val_metrics:
+        return "tri_acc"
+    if "binary_auc" in val_metrics and val_metrics["binary_auc"] == val_metrics["binary_auc"]:
+        return "binary_auc"
+    return "loss"
+
+
+def is_better(metric_name: str, current: float, best: float) -> bool:
+    if metric_name == "loss":
+        return current < best
+    return current > best
+
+
+def metric_init_value(metric_name: str) -> float:
+    if metric_name == "loss":
+        return float("inf")
+    return float("-inf")
+
+
+def print_metrics(prefix: str, metrics: dict):
+    parts = [prefix]
+    for k, v in metrics.items():
+        if isinstance(v, float):
+            parts.append(f"{k}={v:.6f}")
+        else:
+            parts.append(f"{k}={v}")
+    print(" | ".join(parts))
+
+
+def log_metrics(writer, split: str, metrics: dict, epoch: int):
+    if writer is None:
+        return
+    for k, v in metrics.items():
+        if isinstance(v, (int, float)):
+            writer.add_scalar(f"{split}/{k}", v, epoch)
 
 
 def main():
@@ -73,62 +149,76 @@ def main():
     save_dir = Path(opt.checkpoints_dir) / opt.name
     save_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. dataloader
+    print("=" * 80)
+    print("Start training")
+    print(f"device   : {device}")
+    print(f"save_dir : {save_dir}")
+    print("=" * 80)
+
+    # 1. dataloaders
     train_dataset, train_loader, val_dataset, val_loader = build_dataloaders(opt)
 
-    print(f"Train dataset size: {len(train_dataset)}")
-    print(f"Val dataset size:   {len(val_dataset)}")
-    print(f"Train loader steps per epoch: {len(train_loader)}")
-    print(f"Val loader steps:            {len(val_loader)}")
+    print(f"Train dataset size : {len(train_dataset)}")
+    print(f"Val dataset size   : {len(val_dataset)}")
+    print(f"Train steps/epoch  : {len(train_loader)}")
+    print(f"Val steps          : {len(val_loader)}")
+    print("=" * 80)
 
     # 2. model
-    model = build_model(opt, device=device)
+    model = build_model(opt, device)
 
     # 3. trainer
-    trainer = Trainer(
-        model=model,
-        device=device,
-        lr=opt.lr,
-        weight_decay=opt.weight_decay,
-        optimizer_type=opt.optimizer,
-        aux_loss_weight=opt.aux_loss_weight,
-        label_smoothing=opt.label_smoothing,
-        use_amp=opt.use_amp,
-        grad_clip_norm=opt.grad_clip_norm,
-        save_dir=str(save_dir),
-    )
+    trainer = build_trainer(opt, model, save_dir, device)
 
-    # ===== 可选：断点恢复 =====
+    # 4. tensorboard
+    train_writer = SummaryWriter(str(save_dir / "tensorboard" / "train")) if SummaryWriter else None
+    val_writer = SummaryWriter(str(save_dir / "tensorboard" / "val")) if SummaryWriter else None
+
+    # 5. visualizer（可选）
+    visualizer = TrainingVisualizer(save_root=str(save_dir / "training_vis")) if TrainingVisualizer else None
+
+    # 6. resume（可选）
     start_epoch = 0
-    # 如果你后面加 resume 参数，可以在这里恢复
-    # if opt.resume_path:
-    #     start_epoch, _ = trainer.load_checkpoint(opt.resume_path, strict=True)
-    #     start_epoch += 1
+    resume_path = opt_get(opt, "resume_path", None)
+    if resume_path:
+        print(f"Resume from: {resume_path}")
+        start_epoch, _ = trainer.load_checkpoint(resume_path, strict=True)
+        start_epoch += 1
 
-    # 4. train loop
-    best_metric = float("-inf")
-    best_metric_name = "macro_auc" if opt.final_num_classes > 2 else "tri_acc"
+    # 7. main loop
+    epochs = opt_get(opt, "epochs", opt_get(opt, "niter", 20))
+    save_epoch_freq = opt_get(opt, "save_epoch_freq", 1)
 
-    print(f"Best model selection metric: {best_metric_name}")
+    best_metric_name = None
+    best_metric_value = None
 
-    for epoch in range(start_epoch, opt.epochs):
-        print(f"\n========== Epoch {epoch + 1}/{opt.epochs} ==========")
+    for epoch in range(start_epoch, epochs):
+        print(f"\n{'=' * 30} Epoch {epoch + 1}/{epochs} {'=' * 30}")
 
         train_metrics = trainer.train_one_epoch(
             train_loader,
             epoch=epoch,
-            log_interval=opt.log_interval,
+            log_interval=opt_get(opt, "log_interval", 20),
         )
-        print(f"[Train] {train_metrics}")
+        print_metrics("[Train]", train_metrics)
+        log_metrics(train_writer, "train", train_metrics, epoch)
 
         val_metrics = trainer.evaluate(
             val_loader,
             epoch=epoch,
         )
-        print(f"[Val]   {val_metrics}")
+        print_metrics("[Val]", val_metrics)
+        log_metrics(val_writer, "val", val_metrics, epoch)
 
-        # 5. 保存最新/周期模型
-        if (epoch + 1) % opt.save_epoch_freq == 0:
+        if visualizer is not None:
+            visualizer.update(
+                epoch=epoch,
+                train_metrics=train_metrics,
+                val_metrics=val_metrics,
+            )
+
+        # 周期保存
+        if (epoch + 1) % save_epoch_freq == 0:
             trainer.save_checkpoint(
                 filename=f"epoch_{epoch + 1}.pth",
                 epoch=epoch,
@@ -138,26 +228,35 @@ def main():
                 },
             )
 
-        # 6. 保存最佳模型
-        current_metric = val_metrics.get(best_metric_name, None)
+        # best 模型保存
+        if best_metric_name is None:
+            best_metric_name = choose_best_metric(val_metrics)
+            best_metric_value = metric_init_value(best_metric_name)
+            print(f"Best metric = {best_metric_name}")
 
-        # 如果没有 macro_auc，就退回 tri_acc
-        if current_metric is None:
-            current_metric = val_metrics.get("tri_acc", None)
+        current_metric_value = float(val_metrics[best_metric_name])
 
-        if current_metric is not None and current_metric > best_metric:
-            best_metric = current_metric
+        if is_better(best_metric_name, current_metric_value, best_metric_value):
+            best_metric_value = current_metric_value
             trainer.save_checkpoint(
                 filename="best.pth",
                 epoch=epoch,
                 extra={
                     "best_metric_name": best_metric_name,
-                    "best_metric_value": best_metric,
+                    "best_metric_value": best_metric_value,
                     "train_metrics": train_metrics,
                     "val_metrics": val_metrics,
                 },
             )
-            print(f"[Best] Updated best model: {best_metric_name}={best_metric:.6f}")
+            print(f"[Best] Updated: {best_metric_name}={best_metric_value:.6f}")
+
+    # 8. finalize
+    if train_writer is not None:
+        train_writer.close()
+    if val_writer is not None:
+        val_writer.close()
+    if visualizer is not None:
+        visualizer.finalize()
 
     print("\nTraining finished.")
 

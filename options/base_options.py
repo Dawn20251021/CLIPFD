@@ -14,16 +14,21 @@ class BaseOptions:
         parser.add_argument("--checkpoints_dir", type=str, default="./checkpoints", help="checkpoint save root")
         parser.add_argument("--gpu_ids", type=str, default="0", help="gpu ids, e.g. 0 or 0,1 or -1 for cpu")
 
-        # ===== data_deal =====
-        parser.add_argument("--train_image_root", type=str, default=None, help="train image folder")
-        parser.add_argument("--train_label_json", type=str, default=None, help="train label json")
-        parser.add_argument("--val_image_root", type=str, default=None, help="val image folder")
-        parser.add_argument("--val_label_json", type=str, default=None, help="val label json")
-        parser.add_argument("--test_image_root", type=str, default=None, help="test image folder")
-        parser.add_argument("--test_label_json", type=str, default=None, help="test label json")
+        # 路径参数
+        project_root = Path(__file__).resolve().parents[1]
+        dataset_root = project_root / "datasets"
+        default_clip_ckpt = project_root / "models" / "parameters" / "ViT-L-14.pt"
+
+        # ===== data paths =====
+        parser.add_argument("--train_image_root",type=str,default=str(dataset_root / "train_images"),help="train image folder")
+        parser.add_argument("--train_label_json",type=str,default=str(dataset_root / "train_labels.json"),help="train label json file")
+        parser.add_argument("--val_image_root",type=str,default=str(dataset_root / "val_images"),help="validation image folder")
+        parser.add_argument("--val_label_json",type=str,default=str(dataset_root / "val_labels.json"),help="validation label json file")
+        parser.add_argument("--test_image_root",type=str,default=str(dataset_root / "test_images"),help="test image folder")
+        parser.add_argument("--test_label_json",type=str,default=str(dataset_root / "test_labels.json"),help="test label json file")
 
         # ===== dataloader =====
-        parser.add_argument("--batch_size", type=int, default=16, help="batch size")
+        parser.add_argument("--batch_size", type=int, default=8, help="batch size")
         parser.add_argument("--num_workers", type=int, default=4, help="dataloader workers")
         parser.add_argument("--pin_memory", action="store_true", help="use pin_memory")
         parser.add_argument("--persistent_workers", action="store_true", help="use persistent_workers")
@@ -35,8 +40,12 @@ class BaseOptions:
         parser.add_argument("--no_flip", action="store_true", help="disable random flip in train")
 
         # ===== model =====
-        parser.add_argument("--backbone_name", type=str, default='../models/parameters/ViT-L-14.pt', help="CLIP backbone name")
-        parser.add_argument("--freeze_backbone", action="store_true", help="freeze CLIP backbone")
+        # 模型主体参数
+        parser.add_argument("--backbone_name", type=str, default=r"E:\Project\CLIPFD\models\parameters\ViT-L-14.pt", help="CLIP backbone name")
+        # 冻结主体模型参数不做训练
+        parser.add_argument("--freeze_backbone",action="store_true",default=True,help="freeze CLIP backbone")
+        parser.add_argument("--unfreeze_backbone",action="store_false",dest="freeze_backbone",help="train CLIP backbone")
+        # 是否使用主干分支进行二分类
         parser.add_argument("--use_global_aux_head", action="store_true", help="enable global auxiliary binary head")
 
         parser.add_argument("--final_num_classes", type=int, default=3, help="final fusion classifier classes")
