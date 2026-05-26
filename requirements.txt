@@ -1,0 +1,4 @@
+regex==2026.4.4
+scikit_learn==1.8.0
+torchvision==0.26.0+cu128
+tqdm==4.67.3
