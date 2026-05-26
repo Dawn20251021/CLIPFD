@@ -11,7 +11,6 @@
 - [模型结构](#模型结构)
 - [项目特点](#项目特点)
 - [项目目录](#项目目录)
-- [环境依赖](#环境依赖)
 - [数据组织方式](#数据组织方式)
 - [训练说明](#训练说明)
 - [测试说明](#测试说明)
@@ -137,8 +136,17 @@ CLIPFD/
 ├── datasets/                          # 数据集目录
 └── checkpoints/                       # 训练输出目录
 
+---
 
-
+## 数据组织方式
+项目默认使用如下数据目录结构：
+datasets/
+├── train_images/
+├── train_labels.json
+├── val_images/
+├── val_labels.json
+├── test_images/
+└── test_labels.json
 
 
 
